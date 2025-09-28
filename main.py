@@ -2,6 +2,8 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
 import numpy as np, cv2, tempfile, os, json
 from sklearn.cluster import KMeans
 try:
@@ -11,6 +13,25 @@ except Exception:
 
 app = FastAPI(title="Offline Floorplan CV Generator")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# New data models for enhanced API
+class VastuPreferences(BaseModel):
+    mainEntrance: str
+    masterBedroom: str
+    kitchen: str
+    puja: bool
+    staircase: str
+
+class Requirements(BaseModel):
+    bedrooms: int
+    bathrooms: int
+    kitchenOrientation: str
+    vastPreferences: VastuPreferences
+    additionalRooms: List[str]
+
+class GeneratePlanRequest(BaseModel):
+    processed_data: Dict[str, Any]
+    requirements: Requirements
 
 def read_image_bytes(data: bytes):
     arr = np.frombuffer(data, np.uint8)
@@ -134,6 +155,138 @@ def build_dxf(layout, plot_w_m, plot_h_m, out_path):
         msp.add_text(f\"{r['name']} {round(r['w_m'],2)}x{round(r['h_m'],2)}m\", dxfattribs={'height':100}).set_pos((x+10,y+10))
     doc.saveas(out_path)
 
+def generate_enhanced_plan(processed_data: Dict[str, Any], requirements: Requirements) -> Dict[str, Any]:
+    """
+    Enhanced plan generation with Vastu compliance and room optimization
+    """
+    layout = processed_data.get('layout', [])
+    plot_bbox = processed_data.get('plot_bbox_px', [0, 0, 100, 100])
+    meters_per_px = processed_data.get('meters_per_px', 0.1)
+    
+    # Calculate plot dimensions
+    plot_w_m = plot_bbox[2] * meters_per_px
+    plot_h_m = plot_bbox[3] * meters_per_px
+    
+    # Enhanced room assignment based on requirements
+    enhanced_rooms = []
+    room_types = ['Living Room', 'Master Bedroom'] + \
+                 [f'Bedroom {i+2}' for i in range(requirements.bedrooms - 1)] + \
+                 [f'Bathroom {i+1}' for i in range(requirements.bathrooms)] + \
+                 ['Kitchen', 'Dining Room'] + \
+                 (['Puja Room'] if requirements.vastPreferences.puja else []) + \
+                 requirements.additionalRooms
+    
+    # Assign room types to detected spaces
+    for i, room in enumerate(layout[:len(room_types)]):
+        room_name = room_types[i] if i < len(room_types) else f'Room {i+1}'
+        enhanced_rooms.append({
+            'name': room_name,
+            'bbox_px': room['bbox_px'],
+            'x_m': room['x_m'],
+            'y_m': room['y_m'],
+            'w_m': room['w_m'],
+            'h_m': room['h_m'],
+            'area_m2': room['area_m2']
+        })
+    
+    # Calculate Vastu score (simplified)
+    vastu_score = calculate_vastu_score(enhanced_rooms, requirements.vastPreferences, plot_w_m, plot_h_m)
+    
+    # Generate suggestions
+    suggestions = generate_suggestions(enhanced_rooms, requirements, vastu_score)
+    
+    # Generate SVG
+    svg_data = generate_svg_plan(enhanced_rooms, plot_w_m, plot_h_m)
+    
+    return {
+        'rooms': enhanced_rooms,
+        'metadata': {
+            'total_area': sum(room['area_m2'] for room in enhanced_rooms),
+            'vastu_score': vastu_score,
+            'suggestions': suggestions
+        },
+        'svg_data': svg_data
+    }
+
+def calculate_vastu_score(rooms: List[Dict], vastu_prefs: VastuPreferences, plot_w: float, plot_h: float) -> int:
+    """Calculate Vastu compliance score (0-100)"""
+    score = 70  # Base score
+    
+    # Check kitchen position
+    kitchen_rooms = [r for r in rooms if 'Kitchen' in r['name']]
+    if kitchen_rooms:
+        kitchen = kitchen_rooms[0]
+        # Southeast is ideal for kitchen
+        if kitchen['x_m'] > plot_w/2 and kitchen['y_m'] > plot_h/2:
+            score += 10
+    
+    # Check master bedroom position
+    master_rooms = [r for r in rooms if 'Master' in r['name']]
+    if master_rooms:
+        master = master_rooms[0]
+        # Southwest is ideal for master bedroom
+        if master['x_m'] < plot_w/2 and master['y_m'] > plot_h/2:
+            score += 10
+    
+    # Puja room bonus
+    puja_rooms = [r for r in rooms if 'Puja' in r['name']]
+    if puja_rooms and vastu_prefs.puja:
+        score += 5
+    
+    return min(100, max(0, score))
+
+def generate_suggestions(rooms: List[Dict], requirements: Requirements, vastu_score: int) -> List[str]:
+    """Generate improvement suggestions"""
+    suggestions = []
+    
+    if vastu_score < 80:
+        suggestions.append("Consider repositioning the kitchen to the southeast corner for better Vastu compliance")
+    
+    if vastu_score < 70:
+        suggestions.append("Master bedroom placement could be optimized for southwest direction")
+    
+    # Check room sizes
+    small_rooms = [r for r in rooms if r['area_m2'] < 9]  # Less than 3x3m
+    if small_rooms:
+        suggestions.append(f"Consider combining small rooms: {', '.join([r['name'] for r in small_rooms[:2]])}")
+    
+    if len(suggestions) == 0:
+        suggestions.append("Your floor plan has excellent Vastu compliance!")
+    
+    return suggestions
+
+def generate_svg_plan(rooms: List[Dict], plot_w: float, plot_h: float) -> str:
+    """Generate SVG representation of the floor plan"""
+    svg_width = 800
+    svg_height = int(svg_width * (plot_h / plot_w))
+    scale_x = svg_width / plot_w
+    scale_y = svg_height / plot_h
+    
+    svg = f'<svg width="{svg_width}" height="{svg_height}" viewBox="0 0 {plot_w} {plot_h}" xmlns="http://www.w3.org/2000/svg">'
+    
+    # Plot boundary
+    svg += f'<rect x="0" y="0" width="{plot_w}" height="{plot_h}" fill="#f8f9fa" stroke="#333" stroke-width="0.05"/>'
+    
+    # Room colors
+    colors = ['#e3f2fd', '#f3e5f5', '#e8f5e8', '#fff3e0', '#fce4ec', '#e0f2f1', '#f1f8e9', '#fff8e1']
+    
+    # Draw rooms
+    for i, room in enumerate(rooms):
+        color = colors[i % len(colors)]
+        x, y, w, h = room['x_m'], room['y_m'], room['w_m'], room['h_m']
+        
+        # Room rectangle
+        svg += f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{color}" stroke="#666" stroke-width="0.02"/>'
+        
+        # Room label
+        text_x = x + w/2
+        text_y = y + h/2
+        svg += f'<text x="{text_x}" y="{text_y}" text-anchor="middle" dominant-baseline="middle" font-size="0.3" font-family="Arial, sans-serif" fill="#333">'
+        svg += f'{room["name"]}<tspan x="{text_x}" dy="0.4">{room["w_m"]:.1f}×{room["h_m"]:.1f}m</tspan></text>'
+    
+    svg += '</svg>'
+    return svg
+
 @app.post('/api/process')
 async def process(file: UploadFile = File(...), plot_width_m: float = Form(None), plot_height_m: float = Form(None), scale_bar_px: float = Form(None), scale_bar_m: float = Form(None), k_clusters: int = Form(4)):
     img_bytes = await file.read()
@@ -170,6 +323,53 @@ async def process(file: UploadFile = File(...), plot_width_m: float = Form(None)
     except Exception as e:
         return JSONResponse({'error':'dxf_failed','details':str(e),'layout':layout})
     return JSONResponse({'plot_bbox_px':plot_bbox,'meters_per_px':px_to_m,'layout':layout,'wall_lines':wall_lines,'openings':openings,'dxf_path':tmp.name})
+
+@app.post('/api/generate-plan')
+async def generate_plan(request: GeneratePlanRequest):
+    """Generate enhanced floor plan with Vastu compliance"""
+    try:
+        plan = generate_enhanced_plan(request.processed_data, request.requirements)
+        return JSONResponse(plan)
+    except Exception as e:
+        return JSONResponse({'error': 'plan_generation_failed', 'details': str(e)}, status_code=500)
+
+@app.post('/api/download/{format}')
+async def download_plan(format: str, plan_data: Dict[str, Any]):
+    """Download plan in specified format"""
+    try:
+        if format == 'json':
+            # Return JSON data
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.json', mode='w')
+            json.dump(plan_data, tmp, indent=2)
+            tmp.close()
+            return FileResponse(path=tmp.name, filename='floorplan.json', media_type='application/json')
+        
+        elif format == 'dxf':
+            # Generate DXF file
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.dxf')
+            tmp.close()
+            
+            rooms = plan_data.get('rooms', [])
+            if rooms:
+                plot_w = max(r['x_m'] + r['w_m'] for r in rooms)
+                plot_h = max(r['y_m'] + r['h_m'] for r in rooms)
+                build_dxf(rooms, plot_w, plot_h, tmp.name)
+            
+            return FileResponse(path=tmp.name, filename='floorplan.dxf', media_type='application/dxf')
+        
+        elif format in ['pdf', 'png']:
+            # For now, return SVG data as text (would need additional libraries for PDF/PNG)
+            svg_data = plan_data.get('svg_data', '')
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{format}', mode='w')
+            tmp.write(svg_data)
+            tmp.close()
+            return FileResponse(path=tmp.name, filename=f'floorplan.{format}', media_type=f'image/{format}')
+        
+        else:
+            return JSONResponse({'error': 'unsupported_format'}, status_code=400)
+            
+    except Exception as e:
+        return JSONResponse({'error': 'download_failed', 'details': str(e)}, status_code=500)
 
 @app.get('/api/download')
 async def download(file: str):
